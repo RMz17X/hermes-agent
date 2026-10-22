@@ -1036,6 +1036,60 @@ class GatewaySlashCommandsMixin(
             adapter._busy_text_mode = self._effective_busy_text_mode(event.source)
         return EphemeralReply(t("gateway.busy.set", mode=arg, behavior=t(_BUSY_MODE_BEHAVIOR[arg][1])))
 
+    async def _handle_codingmode_command(self, event: MessageEvent) -> str | EphemeralReply:
+        """Handle /codingmode — pin how coding work runs in this session.
+
+        Stored at ``agent.coding_mode``; the agent reads it at task time and
+        routes accordingly. Valid modes: ``local`` (do it in this session),
+        ``subagent`` (delegate_task), ``kanban`` (board card). No arg or
+        ``status`` shows the current mode without changing it.
+        """
+        arg = event.get_command_args().strip().lower()
+        valid = {"local", "subagent", "kanban"}
+        try:
+            user_config: dict = self._read_user_config()
+        except Exception:
+            user_config = {}
+        agent_cfg = user_config.get("agent") if isinstance(user_config, dict) else None
+        current = ""
+        if isinstance(agent_cfg, dict):
+            current = str(agent_cfg.get("coding_mode") or "").strip().lower()
+        if not arg or arg in ("status", "?", "show"):
+            if not current:
+                return EphemeralReply(
+                    "Coding mode: unset (auto)\n"
+                    "Agent picks per task: local for small/DevOps, subagent for heavy isolated "
+                    "work, kanban for anything that must survive restart or needs review.\n"
+                    "Set one with: /codingmode local | subagent | kanban"
+                )
+            return EphemeralReply(f"Coding mode: {current}\nChange with: /codingmode local | subagent | kanban")
+        if arg not in valid:
+            return EphemeralReply(f"Unknown coding mode: {arg!r}. Valid: local | subagent | kanban")
+
+        from cli import save_config_value
+        if not save_config_value("agent.coding_mode", arg):
+            return EphemeralReply(f"Failed to save coding_mode={arg}.")
+
+        # Live state: the frozen session does not re-read config.yaml.
+        live = None
+        try:
+            from gateway.session_setting_commands import local_live
+            live = local_live(self, event.source)
+        except Exception:
+            live = None
+        if live is not None:
+            live.coding_mode = arg
+
+        meaning = {
+            "local": "coding work runs in this session, directly on disk",
+            "subagent": "coding work is delegated via delegate_task (summary returned)",
+            "kanban": "coding work becomes a board card (coderx worker, survives restart)",
+        }[arg]
+        return EphemeralReply(
+            f"Coding mode set to: {arg}\n{meaning}\n"
+            f"Restart the session to apply it to an already-running agent."
+        )
+
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer."""
         from gateway.run import _load_gateway_config, _resolve_gateway_model
