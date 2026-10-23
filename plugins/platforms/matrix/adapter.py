@@ -1287,12 +1287,60 @@ class MatrixAdapter(BasePlatformAdapter):
                         *([output_error] if output_error not in ("not_configured", "exists") else []))
                 else:
                     try:
-                        new_recovery_key = await olm.generate_recovery_key()
-                        _handle_generated_matrix_recovery_key(str(client.mxid), new_recovery_key)
+                        new_recovery_key = await self._bootstrap_cross_signing_keys(olm, client)
+                        if new_recovery_key:
+                            _handle_generated_matrix_recovery_key(str(client.mxid), new_recovery_key)
                     except Exception as exc:
                         logger.warning(
                             "Matrix: cross-signing bootstrap failed (non-fatal — Element will show "
                             "'not verified by its owner'): %s", exc)
+
+    async def _bootstrap_cross_signing_keys(self, olm: Any, client: Any) -> Optional[str]:
+        """Bootstrap cross-signing keys, forwarding a UIA password auth when needed.
+
+        ``OlmMachine.generate_recovery_key()`` (mautrix 0.21.1,
+        ``mautrix/crypto/cross_signing.py:52``) calls ``_publish_cross_signing_keys(seeds.to_keys())``
+        WITHOUT the ``auth`` argument. The ``auth`` parameter exists on both
+        ``_publish_cross_signing_keys`` and the client's ``upload_cross_signing_keys``, but
+        ``generate_recovery_key`` never threads it through — so any homeserver that requires UIA
+        on ``POST /_matrix/client/v3/keys/device_signing/upload`` (Conduit does, returning
+        ``401 {"flows":[{"stages":["m.login.password"]}]}``) rejects the upload and the adapter
+        can never complete cross-signing. ``MATRIX_PASSWORD`` alone therefore cannot help.
+
+        This mirrors ``generate_recovery_key`` step for step but passes ``auth`` through, so
+        ``MATRIX_PASSWORD`` becomes the credential that satisfies the UIA challenge. When no
+        password is configured it delegates to the stock helper (correct for homeservers that
+        do not require UIA).
+
+        Conduit accepts a session-less ``auth`` object (verified: correct password + no
+        ``session`` field returns ``200 {}``; wrong password returns ``M_FORBIDDEN``), so no
+        two-phase challenge dance is needed.
+
+        Returns the new recovery key, or whatever the stock helper returned.
+        """
+        auth = None
+        password = (self._password or "").strip()
+        if password:
+            auth = {
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": str(client.mxid)},
+                "password": password,
+            }
+        if auth is None:
+            # Nothing to satisfy — the stock helper is correct for non-UIA homeservers.
+            return await olm.generate_recovery_key()
+
+        from mautrix.crypto.cross_signing_key import CrossSigningSeeds
+
+        if not getattr(olm.account, "shared", False):
+            raise ValueError("Device keys must be shared before generating recovery key")
+        seeds = CrossSigningSeeds.generate()
+        ssss_key = await olm.ssss.generate_and_upload_key(None)
+        await olm._upload_cross_signing_keys_to_ssss(ssss_key, seeds)
+        await olm._publish_cross_signing_keys(seeds.to_keys(), auth=auth)
+        await olm.ssss.set_default_key_id(ssss_key.id)
+        await olm.sign_own_device(olm.own_identity)
+        return ssss_key.recovery_key
 
     async def _connect_initial_sync(self, client: Any) -> None:
         """Full initial sync: seed joined rooms, DM cache, and dispatch queued to-device events."""
