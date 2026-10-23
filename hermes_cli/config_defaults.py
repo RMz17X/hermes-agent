@@ -1916,6 +1916,11 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Default per-task runtime cap applied when `kanban create` passes no explicit
+        # --max-runtime. Without it a wedged worker (upstream LLM hang, EOFError stall) holds
+        # the card in `running` forever: heartbeats keep ticking, no terminal event ever fires,
+        # and the notifier has nothing to deliver. 0/None = off (not recommended).
+        "default_max_runtime_seconds": 3600,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

@@ -332,6 +332,86 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _auto_subscribe_creator(conn, task_id: str) -> bool:
+    """Subscribe the originating chat to *task_id*'s terminal events.
+
+    Without this, a card created from the CLI (or by a cron/agent) finishes
+    silently: ``kanban_notify_subs`` stays empty, so the gateway notifier has
+    nobody to deliver to. The gateway's ``/kanban create`` path already
+    auto-subscribes; the CLI path did not, which is why board cards produced
+    from a terminal never reported completion.
+
+    Source of truth, in order:
+      1. ``HERMES_SESSION_*`` env — set when the CLI runs inside an agent turn,
+         so the report lands in the exact chat/thread that asked for the card.
+      2. ``platforms.<p>.home_channel`` — fallback for cron/systemd runs with
+         no session env, so the report still lands somewhere the operator reads.
+
+    Best-effort: any failure is swallowed. A missing notification must never
+    break card creation.
+    """
+    try:
+        platform = (os.environ.get("HERMES_SESSION_PLATFORM") or "").strip().lower()
+        chat_id = (os.environ.get("HERMES_SESSION_PARENT_CHAT_ID")
+                   or os.environ.get("HERMES_SESSION_CHAT_ID") or "").strip()
+        thread_id = (os.environ.get("HERMES_SESSION_THREAD_ID") or "").strip() or None
+        chat_type = (os.environ.get("HERMES_SESSION_CHAT_TYPE") or "").strip() or None
+        user_id = (os.environ.get("HERMES_SESSION_USER_ID") or "").strip() or None
+        user_id_alt = (os.environ.get("HERMES_SESSION_USER_ID_ALT") or "").strip() or None
+        profile = (os.environ.get("HERMES_SESSION_PROFILE") or "").strip() or None
+
+        if not (platform and chat_id):
+            platform, chat_id, thread_id, chat_type, user_id, profile = _home_channel_target()
+
+        if not (platform and chat_id):
+            return False
+
+        metadata = {}
+        parent = (os.environ.get("HERMES_SESSION_PARENT_CHAT_ID") or "").strip()
+        if parent and thread_id:
+            metadata["parent_chat_id"] = parent
+        scope = (os.environ.get("HERMES_SESSION_SCOPE_ID") or "").strip()
+        if scope and platform == "discord":
+            metadata["guild_id"] = scope
+
+        kbn.add_notify_sub(
+            conn, task_id=task_id, platform=platform, chat_id=chat_id,
+            chat_type=chat_type, thread_id=thread_id, user_id=user_id,
+            user_id_alt=user_id_alt,
+            notifier_profile=profile or _profile_author(),
+            delivery_mode="notify+wake",
+            delivery_metadata=metadata or None,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _home_channel_target():
+    """First configured ``platforms.<p>.home_channel`` as a subscribe target."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return (None, None, None, None, None, None)
+    platforms = cfg.get("platforms") or {}
+    for name, pcfg in platforms.items():
+        if not isinstance(pcfg, dict) or not pcfg.get("enabled"):
+            continue
+        home = pcfg.get("home_channel")
+        if not isinstance(home, dict) or not home.get("chat_id"):
+            continue
+        return (
+            str(name).lower(),
+            str(home.get("chat_id")),
+            str(home.get("thread_id")) if home.get("thread_id") else None,
+            "thread" if home.get("thread_id") else "channel",
+            None,
+            None,
+        )
+    return (None, None, None, None, None, None)
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -356,6 +436,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
         return _err(f"kanban: --max-runtime: {exc}", 2)
+    if max_runtime is None:
+        # No explicit cap: fall back to kanban.default_max_runtime_seconds so a
+        # wedged worker (upstream LLM hang) is killed by enforce_max_runtime
+        # instead of holding the card in `running` forever with live heartbeats.
+        try:
+            from hermes_cli.config import load_config_readonly
+            _dflt = ((load_config_readonly() or {}).get("kanban") or {}) \
+                .get("default_max_runtime_seconds")
+            if _dflt and int(_dflt) > 0:
+                max_runtime = int(_dflt)
+        except Exception:
+            pass
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
@@ -379,6 +471,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        _auto_subscribe_creator(conn, task_id)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
