@@ -15,6 +15,7 @@ from agent.title_generator import (
     maybe_auto_title,
     wait_for_title_upgrades,
     _title_language,
+    _repo_hint,
 )
 from hermes_state import SessionDB
 
@@ -307,6 +308,8 @@ class TestGenerateTitle:
             captured.append((task, exc))
 
         exc = RuntimeError("openrouter 402: credits exhausted")
+        # A generic failure (not a reasoning-rejection retry) must propagate to
+        # the existing failure_callback path, unchanged by the new retry.
         with patch("agent.title_generator.call_llm", side_effect=exc):
             result = generate_title("question", "answer", failure_callback=_cb)
 
@@ -314,6 +317,49 @@ class TestGenerateTitle:
         assert len(captured) == 1
         assert captured[0][0] == "title generation"
         assert captured[0][1] is exc
+
+    def test_reasoning_rejection_retries_without_switch(self):
+        """A model that rejects the reasoning switch must be retried once, not failed."""
+        from agent.title_generator import _is_reasoning_rejection
+
+        rejected = RuntimeError(
+            "[400 · llm7-free/codestral-latest]: Model 'codestral-latest' does not support reasoning."
+        )
+        assert _is_reasoning_rejection(rejected) is True
+
+        captured = []
+
+        def _fake_call_llm(**kwargs):
+            captured.append(kwargs)
+            if "reasoning_config" in kwargs:
+                raise rejected
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Jetstream-APP fix upload flow"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=_fake_call_llm):
+            out = generate_title("cek jetstream fix upload", session_cwd="/workspaces/Jetstream-APP")
+        # First call carried the switch; the retry dropped it and succeeded.
+        assert out == "Jetstream-APP fix upload flow"
+        assert len(captured) == 2
+        assert "reasoning_config" in captured[0]
+        assert "reasoning_config" not in captured[1]
+        assert captured[1]["messages"][0]["content"].startswith("You name chat sessions. The session is about the repository")
+
+    def test_non_reasoning_failure_still_propagates(self):
+        """A non-reasoning error (rate limit, auth) must NOT be swallowed by the retry."""
+        from agent.title_generator import _is_reasoning_rejection
+
+        assert _is_reasoning_rejection(RuntimeError("429 Too Many Requests")) is False
+        captured = []
+
+        def _cb(task, exc):
+            captured.append((task, exc))
+
+        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("429 Too Many Requests")):
+            assert generate_title("question", failure_callback=_cb) is None
+        assert len(captured) == 1
 
 
 
@@ -898,3 +944,127 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+class TestRepoHintTitleGrounding:
+    """Repo-aware titles: the title must carry the repo name when one is identifiable."""
+
+    def _response(self, content):
+        resp = MagicMock(spec=["choices"])
+        resp.choices = [MagicMock(spec=["message"])]
+        resp.choices[0].message = MagicMock(spec=["content"])
+        resp.choices[0].message.content = content
+        return resp
+
+    def test_repo_named_in_message_reaches_the_prompt(self, tmp_path, monkeypatch):
+        root = tmp_path / "ws"
+        (root / "Jetstream-APP").mkdir(parents=True)
+        (root / "Jetstream-APP" / "package.json").write_text("{}")
+        monkeypatch.setenv("TERMINAL_CWD", str(root))
+        from agent.title_generator import _repo_hint, _REPO_NAME_CACHE
+
+        _REPO_NAME_CACHE.clear()
+        assert _repo_hint("cek sistem jetstream, tambah referral", "") == "Jetstream-APP"
+
+        captured = {}
+        with patch("agent.title_generator.call_llm", side_effect=lambda **kw: captured.update(kw) or self._response('{"title": "Tambah referral"}')):
+            title = generate_title("cek sistem jetstream, tambah referral")
+        assert title == "Jetstream-APP: Tambah referral"
+        assert "Jetstream-APP" in captured["messages"][0]["content"]
+
+    def test_model_output_that_ignores_the_prefix_still_gets_it(self, tmp_path, monkeypatch):
+        root = tmp_path / "ws"
+        (root / "rustrot").mkdir(parents=True)
+        (root / "rustrot" / "Cargo.toml").write_text("")
+        monkeypatch.setenv("TERMINAL_CWD", str(root))
+        from agent.title_generator import _REPO_NAME_CACHE
+
+        _REPO_NAME_CACHE.clear()
+        with patch("agent.title_generator.call_llm", return_value=self._response('{"title": "Proxy rotation stuck"}')):
+            assert generate_title("cek rustrot proxy rotasinya stuck") == "rustrot: Proxy rotation stuck"
+
+    def test_existing_repo_name_is_not_duplicated(self, tmp_path, monkeypatch):
+        root = tmp_path / "ws"
+        (root / "AxonRouter").mkdir(parents=True)
+        (root / "AxonRouter" / "package.json").write_text("{}")
+        monkeypatch.setenv("TERMINAL_CWD", str(root))
+        from agent.title_generator import _REPO_NAME_CACHE
+
+        _REPO_NAME_CACHE.clear()
+        with patch("agent.title_generator.call_llm", return_value=self._response('{"title": "AxonRouter combo fallback broken"}')):
+            assert generate_title("cek AxonRouter combo fallback") == "AxonRouter combo fallback broken"
+
+    def test_no_repo_in_message_keeps_the_plain_prompt(self, tmp_path, monkeypatch):
+        root = tmp_path / "ws"
+        root.mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(root))
+        from agent.title_generator import _REPO_NAME_CACHE
+
+        _REPO_NAME_CACHE.clear()
+        captured = {}
+        with patch("agent.title_generator.call_llm", side_effect=lambda **kw: captured.update(kw) or self._response('{"title": "Gas ah"}')):
+            assert generate_title("Gas ah") == "Gas ah"
+        assert "MUST start with the exact project name" not in captured["messages"][0]["content"]
+
+    def test_cwd_repo_wins_over_message_matching(self, tmp_path, monkeypatch):
+        root = tmp_path / "ws"
+        (root / "alpha-repo").mkdir(parents=True)
+        (root / "alpha-repo" / "go.mod").write_text("")
+        (root / "beta-repo").mkdir(parents=True)
+        (root / "beta-repo" / "go.mod").write_text("")
+        monkeypatch.setenv("TERMINAL_CWD", str(root))
+        from agent.title_generator import _REPO_NAME_CACHE
+
+        _REPO_NAME_CACHE.clear()
+        assert _repo_hint("cek beta-repo", str(root / "alpha-repo")) == "alpha-repo"
+
+    def test_generic_words_do_not_resolve_to_a_repo(self, tmp_path, monkeypatch):
+        root = tmp_path / "ws"
+        for name in ("audit-api", "audit-db"):
+            (root / name).mkdir(parents=True)
+            (root / name / "go.mod").write_text("")
+        # A plain container dir (no .git, no manifest) — like /workspaces/docker.
+        (root / "docker").mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(root))
+        from agent.title_generator import _REPO_NAME_CACHE
+
+        _REPO_NAME_CACHE.clear()
+        # "audit" is an ordinary word: it prefixes real repos but names no project.
+        assert _repo_hint("audit repo ini", "") == ""
+        # "docker" is not even a repo here, so it can never ground a title.
+        assert _repo_hint("deploy docker ke server", "") == ""
+        # ...but an explicit segment is honoured when it is unambiguous.
+        assert _repo_hint("cek audit-api", "") == "audit-api"
+
+    def test_non_repo_directory_is_never_a_hint(self, tmp_path, monkeypatch):
+        root = tmp_path / "ws"
+        (root / "plain-dir").mkdir(parents=True)  # no .git, no manifest
+        monkeypatch.setenv("TERMINAL_CWD", str(root))
+        from agent.title_generator import _REPO_NAME_CACHE
+
+        _REPO_NAME_CACHE.clear()
+        assert _repo_hint("cek plain-dir", "") == ""
+
+    def test_session_cwd_flows_through_maybe_auto_title(self):
+        """The cwd must reach the background thread, or repo grounding silently no-ops."""
+        from agent.title_generator import maybe_auto_title
+
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.get_session_title_source.return_value = None
+        captured = {}
+
+        def fake_spawn(target, *, name, args, kwargs, daemon=True):
+            captured.update(kwargs)
+
+            class _T:
+                ident = None
+
+                def start(self):
+                    pass
+
+            return _T()
+
+        with patch("agent.memory_provider.spawn_context_thread", side_effect=fake_spawn):
+            maybe_auto_title(db, "sess-1", "cek jetstream", session_cwd="/workspaces/Jetstream-APP")
+        assert captured.get("session_cwd") == "/workspaces/Jetstream-APP"

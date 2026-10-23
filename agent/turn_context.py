@@ -195,6 +195,15 @@ def append_notes_to_multimodal_content(content: Any, notes: Optional[str]) -> bo
 _UNTITLED_PLATFORMS = frozenset({"cron"})
 
 
+def _title_scope_cwd() -> str:
+    """The turn's working directory, for repo-aware title grounding (best-effort)."""
+    try:
+        from agent.runtime_cwd import scope_terminal_cwd
+        return str(scope_terminal_cwd() or "").strip()
+    except Exception:
+        return ""
+
+
 def _maybe_title_session_at_turn_start(
     agent: Any, messages: list[Any], title_user_message: Optional[str] = None,
 ) -> None:
@@ -255,6 +264,14 @@ def _maybe_title_session_at_turn_start(
             ),
             main_runtime=main_runtime,
             title_callback=getattr(agent, "_on_session_title", None),
+            # Repo grounding: a session bound to a repo directory titles after that repo
+            # ("Jetstream-APP fix upload flow"). session_cwd is the picked/adopted cwd;
+            # scope_terminal_cwd covers the gateway's configured terminal.cwd.
+            session_cwd=(
+                str(getattr(agent, "session_cwd", "") or "").strip()
+                or str(getattr(agent, "_session_cwd", "") or "").strip()
+                or _title_scope_cwd()
+            ),
             runtime_validator=lambda: (
                 getattr(agent, "model", None) == main_runtime["model"]
                 and getattr(agent, "provider", None) == main_runtime["provider"]

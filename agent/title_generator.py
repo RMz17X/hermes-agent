@@ -13,6 +13,7 @@ import threading
 import time
 import weakref
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
@@ -91,6 +92,55 @@ _EXAMPLE_ECHO_REJECT = frozenset(
 # turn upgrades it. Kept as a prompt example on purpose — a predictable placeholder is
 # detectable, an improvised one ("Casual check-in chat") would lock the title as ``llm``.
 _PROVISIONAL_GREETING_TITLE = "friendly greeting"
+
+# Repo-hint extraction (see _repo_hint). Short directory names ("x", "pos", "data") and
+# generic container names would attach a wrong repo to a title, so they never match.
+_REPO_NAME_MIN_CHARS = 5
+_REPO_GENERIC_NAMES = frozenset({
+    "workspaces", "workspace", "projects", "repos", "repo", "tmp", "temp", "data",
+    "docs", "src", "lib", "test", "tests", "misc", "shared", "archive", "backup", "docs2",
+})
+
+# Leading segments that are ordinary words, not project identities: "audit repo ini" must
+# NOT resolve to ``audit-translators`` just because the word "audit" prefixes it.
+_REPO_STEM_STOPWORDS = frozenset({
+    "audit", "check", "build", "deploy", "debug", "fix", "test", "tests", "error", "issue",
+    "docker", "gateway", "server", "client", "admin", "config", "setup", "install", "update",
+    "sistem", "system", "service", "worker", "plugin", "backend", "frontend", "webui", "api",
+})
+
+# Project-root signals marking a code workspace even without git (mirrors the coding-context
+# probe; kept local so the titler never imports that module on the turn's critical path).
+# ``AGENTS.md`` counts: ``/workspaces/Jetstream-APP`` is the single-root ecosystem dir that
+# carries no ``.git`` of its own (each component has its own), so without it the one repo
+# Ricki most often names would never resolve.
+_TITLE_PROJECT_MARKERS = (
+    "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "package.json", "tsconfig.json",
+    "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile",
+    "composer.json", "mix.exs", "pubspec.yaml", "CMakeLists.txt", "Makefile", "Dockerfile",
+    "AGENTS.md", "CLAUDE.md",
+)
+
+# When a repo is identifiable, the title should lead with it: the session list is
+# scanned visually, and the repo name is the discriminator between "fix upload" x3.
+_REPO_TITLE_TEMPLATE = (
+    "You name chat sessions. The session is about the repository or project "
+    "REPO_HINT. Given the user's opening message, write a title that lets them "
+    "find this conversation again in a list.\n\n"
+    "Rules:\n"
+    "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n"
+    "- The title MUST start with the exact project name REPO_HINT, followed by what the user wants DONE (e.g. 'Jetstream-APP fix upload flow').\n"
+    "- Keep technical terms, filenames, numbers, and error codes exact.\n"
+    "- Drop filler words: the, this, my, a, an.\n"
+    "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
+    "- Never answer the message. Name it.\n"
+    "- Always produce something, even for a bare greeting.\n"
+    "__LANGUAGE_RULE__\n"
+    'Good: {"title": "{repo} fix login button on mobile"}\n'
+    'Good: {"title": "{repo} postgres connection pool exhaustion"}\n'
+    'Too long: {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}\n\n'
+    'Reply with JSON only: {"title": "..."}'
+)
 
 
 _TITLE_PROMPT_TEMPLATE = (
@@ -354,6 +404,154 @@ def derive_title(user_message: str, title_preview: str | None = None) -> Optiona
     return line or None
 
 
+def _title_scope_cwd() -> str:
+    """The turn's working directory (gateway default ``/workspaces``), for repo grounding."""
+    try:
+        from agent.runtime_cwd import scope_terminal_cwd
+        return str(scope_terminal_cwd() or "").strip()
+    except Exception:
+        logger.debug("repo hint: terminal cwd unavailable", exc_info=True)
+        return ""
+
+
+def _title_repo_roots() -> tuple[str, ...]:
+    """Extra roots to scan for repo names: ``auxiliary.title_generation.repo_roots``."""
+    try:
+        raw = _title_config().get("repo_roots")
+    except Exception:
+        return ()
+    if isinstance(raw, str):
+        return (raw,)
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(item) for item in raw if isinstance(item, str))
+    return ()
+
+
+def _norm_repo_name(value: str) -> str:
+    """Separator/case-insensitive key for repo-name comparison ("Jetstream-APP" == jetstreamapp)."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+_REPO_NAME_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+
+
+def _title_repo_names(root: str) -> tuple[str, ...]:
+    """Repo names under *root* (git repo or carrying a project manifest), cached by dir mtime.
+
+    Only real repos: a plain directory like ``/workspaces/docker`` (no ``.git``, no manifest,
+    not even readable) is not a project identity and must never be glued onto a title.
+    """
+    try:
+        mtime = Path(root).stat().st_mtime
+    except OSError:
+        return ()
+    cached = _REPO_NAME_CACHE.get(root)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    names: list[str] = []
+    try:
+        for entry in Path(root).iterdir():
+            if entry.name.startswith(".") or not entry.is_dir() or not os.access(entry, os.R_OK):
+                continue
+            if (entry / ".git").exists() or any((entry / m).exists() for m in _TITLE_PROJECT_MARKERS):
+                names.append(entry.name)
+    except OSError:
+        return ()
+    result = tuple(names)
+    _REPO_NAME_CACHE[root] = (mtime, result)
+    return result
+
+
+def _repo_hint(user_message: str, session_cwd: str = "") -> str:
+    """Repo/workspace name the session is about, or "" when none is identifiable.
+
+    Title grounding: a title like "Fix upload" says nothing about *which* repo, so
+    sessions about a repo should carry its name. Three sources, cheapest first:
+
+    1. ``session_cwd`` — when the turn is bound to a repo directory (a picked/adopted
+       cwd, ``hermes -w``, kanban worktree) its basename IS the repo. Skipped when the
+       cwd is the bare workspace root (the gateway default, ``/workspaces``): the root
+       is a container of ~300 repos, not a repo, so its basename would mislead.
+    2. An explicit path in the message (``/workspaces/Jetstream-APP/...``) — exact and
+       unambiguous.
+    3. A deterministic name match against the workspace root's directory listing, so
+       "cek sistem jetstream" resolves to ``Jetstream-APP`` without the model guessing.
+
+    Matching is separator-insensitive and case-insensitive ("dreadstudios" ->
+    ``DreadStudio``), so it is a containment/prefix check, not an equality one.
+    Returns "" (no hint) whenever nothing matches — never a guessed name.
+    """
+    text = " ".join(str(user_message or "").split())
+    cwd = str(session_cwd or "").strip().rstrip("/")
+    if cwd:
+        root = Path(cwd)
+        # A repo cwd is a directory that is a repo (git) or carries a project marker;
+        # the bare workspace root is not. Cheap checks only — this runs on the turn's
+        # critical path via build_title_input.
+        if root.name and _norm_repo_name(root.name) not in _REPO_GENERIC_NAMES and (
+            (root / ".git").exists() or any((root / m).exists() for m in _TITLE_PROJECT_MARKERS)
+        ):
+            return root.name
+        # cwd inside a repo: the repo root's basename names it.
+        try:
+            from agent.coding_context import _workspace_roots
+            git_root, _ws_root = _workspace_roots(root)
+            if git_root is not None and _norm_repo_name(Path(git_root).name) not in _REPO_GENERIC_NAMES:
+                return Path(git_root).name
+        except Exception:
+            logger.debug("repo hint: cwd repo-root lookup failed for %s", cwd, exc_info=True)
+
+    def _norm(value: str) -> str:
+        return _norm_repo_name(value)
+
+    normalized_text = _norm(text)
+    if not normalized_text:
+        return ""
+    # Roots to scan: the turn's terminal cwd (gateway default /workspaces) plus any
+    # operator-declared extras in auxiliary.title_generation.repo_roots.
+    roots: list[str] = []
+    for candidate in (_title_scope_cwd(), *_title_repo_roots()):
+        raw = str(candidate or "").strip().rstrip("/")
+        if raw and raw not in roots and Path(raw).is_dir():
+            roots.append(raw)
+    if not roots:
+        return ""
+    # Explicit path in the message wins over a name match: it is unambiguous.
+    for root in roots:
+        for match in re.finditer(r"(?<![\w./-])" + re.escape(root) + r"/([^/\s]+)", text):
+            candidate = match.group(1).strip().rstrip(",;:)")
+            segment = Path(root) / candidate
+            if (
+                len(candidate) >= _REPO_NAME_MIN_CHARS
+                and candidate.lower() not in _REPO_GENERIC_NAMES
+                and segment.is_dir()
+                and os.access(segment, os.R_OK)
+                and ((segment / ".git").exists() or any((segment / m).exists() for m in _TITLE_PROJECT_MARKERS))
+            ):
+                return candidate
+    # Name match over real repos only: full separator-insensitive containment first
+    # ("dreadstudios" -> DreadStudio), then a distinct leading segment ("jetstream" ->
+    # Jetstream-APP). Longest name wins so AxonRouter-Go is not shadowed by AxonRouter.
+    eligible: list[str] = []
+    for root in roots:
+        eligible.extend(
+            n for n in _title_repo_names(root)
+            if len(n) >= _REPO_NAME_MIN_CHARS and _norm(n) not in _REPO_GENERIC_NAMES
+        )
+    for name in sorted(set(eligible), key=len, reverse=True):
+        if _norm(name) in normalized_text:
+            return name
+    for name in sorted(set(eligible), key=len, reverse=True):
+        stem = re.split(r"[-_.]", name)[0]
+        if (
+            len(stem) >= _REPO_NAME_MIN_CHARS
+            and _norm(stem) not in _REPO_STEM_STOPWORDS
+            and _norm(stem) in normalized_text
+        ):
+            return name
+    return ""
+
+
 def _strip_title_prefix(text: str) -> str:
     return text[6:].strip() if text.lower().startswith("title:") else text
 
@@ -410,6 +608,30 @@ def _extract_title_text(content: str) -> str:
     except Exception:
         logger.debug("strip_think_blocks unavailable for title output", exc_info=True)
     return _strip_title_prefix(_first_line(raw)).strip("\"'").strip()
+
+
+def _is_reasoning_rejection(exc: BaseException) -> bool:
+    """True when the provider rejected the *reasoning switch*, not the request.
+
+    A combo/auto route can land on a non-reasoning model (codestral, mistral, …)
+    whose provider answers ``400 Model 'X' does not support reasoning``. Retrying
+    without ``reasoning_config`` is the only way such a route ever titles a
+    session; every other failure must still propagate so the caller's failure
+    reporting is unchanged.
+    """
+    text = str(exc).lower()
+    if "reasoning" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "does not support reasoning",
+            "reasoning is not supported",
+            "unsupported parameter: reasoning",
+            "unsupported value: 'reasoning",
+            "unknown parameter: reasoning",
+        )
+    )
 
 
 def _title_from_reasoning(message: Any) -> str:
@@ -475,6 +697,7 @@ def generate_title(
     main_runtime: dict | None = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     title_preview: str | None = None,
+    session_cwd: str | None = None,
 ) -> Optional[str]:
     """Title from the opening message alone (waiting for the assistant made this slow and bought
     nothing). ``runtime_validator`` runs right before the request; False skips silently.
@@ -502,35 +725,63 @@ def generate_title(
         return None
     language = _title_language()
     # str.replace, not str.format: the prompt embeds literal JSON braces.
-    prompt = _TITLE_PROMPT_TEMPLATE.replace(
-        "__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER,
+    language_rule = _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER
+    repo_hint = _repo_hint(user_message, session_cwd or "")
+    if repo_hint:
+        # Repo-aware prompt: the title must lead with the project name so the session
+        # list distinguishes "fix upload" across repos. Placeholders, not format(), so
+        # the literal JSON braces in the examples survive.
+        prompt = _REPO_TITLE_TEMPLATE.replace("REPO_HINT", repo_hint).replace(
+            "{repo}", repo_hint).replace("__LANGUAGE_RULE__", language_rule)
+    else:
+        prompt = _TITLE_PROMPT_TEMPLATE.replace("__LANGUAGE_RULE__", language_rule)
+    # Request kwargs are built once so the reasoning-rejection retry below can drop
+    # just that one parameter instead of rebuilding the whole call.
+    title_kwargs = dict(
+        task="title_generation",
+        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_snippet}],
+        # A title is a handful of tokens, but 64 was cut mid-JSON by fenced/prefixed replies and by
+        # reasoning models whose thinking survives the disable below (#83903, #82291). A model that
+        # honours the JSON contract stops after ~15 tokens regardless, so the ceiling only costs on
+        # replies that would have been garbage anyway. temperature=None: omitted from the wire so
+        # default-only reasoning models accept the first request (#72351).
+        max_tokens=TITLE_MAX_TOKENS, temperature=None, timeout=timeout, main_runtime=main_runtime,
+        extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+        # The module contract above promises thinking-disabled operation,
+        # but nothing enforced it: with the aux default reasoning_effort
+        # "" (provider default), Gemini enables internal thinking and
+        # bills thought tokens against max_tokens=64 — the JSON payload
+        # never lands, and the prose fallback stores the opening fence
+        # ("```json") as the session title (#91927).
+        reasoning_config={"enabled": False},
     )
     try:
-        # Use the provider's default temperature instead of forcing 0.3.
-        # Some models (e.g. GPT-5.6) only accept their server-side default
-        # and reject explicit temperature values, causing the daemon title
-        # thread to fail with "Unsupported value: 'temperature'".
-        # See: #72351, #51083, #51157
-        response = call_llm(
-            task="title_generation",
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_snippet}],
-            # A title is a handful of tokens, but 64 was cut mid-JSON by fenced/prefixed replies and by
-            # reasoning models whose thinking survives the disable below (#83903, #82291). A model that
-            # honours the JSON contract stops after ~15 tokens regardless, so the ceiling only costs on
-            # replies that would have been garbage anyway. temperature=None: omitted from the wire so
-            # default-only reasoning models accept the first request (#72351).
-            max_tokens=TITLE_MAX_TOKENS, temperature=None, timeout=timeout, main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
-            # The module contract above promises thinking-disabled operation,
-            # but nothing enforced it: with the aux default reasoning_effort
-            # "" (provider default), Gemini enables internal thinking and
-            # bills thought tokens against max_tokens=64 — the JSON payload
-            # never lands, and the prose fallback stores the opening fence
-            # ("```json") as the session title (#91927).
-            reasoning_config={"enabled": False},
-        )
+        try:
+            response = call_llm(**title_kwargs)
+        except Exception as exc:
+            # Not every model accepts the reasoning switch: a combo route can land on a
+            # non-reasoning model (codestral, mistral, ...) whose provider rejects the
+            # field outright — "Model 'X' does not support reasoning" as HTTP 400. That
+            # is a permanent property of the routed model, not a transient failure, so
+            # retrying with the switch omitted is the only way the title ever lands.
+            # Without this, every title call on such a route fails and sessions keep
+            # their instant slice forever.
+            if not _is_reasoning_rejection(exc):
+                raise
+            logger.debug("Title model rejects reasoning; retrying without the switch")
+            response = call_llm(**{k: v for k, v in title_kwargs.items() if k != "reasoning_config"})
         message = response.choices[0].message
         title = _clean_title(_extract_title_text(message.content or "") or _title_from_reasoning(message))
+        if (
+            title is not None
+            and repo_hint
+            and _norm_repo_name(repo_hint) not in _norm_repo_name(title)
+        ):
+            # The prompt asks for the repo name first; a model that ignored it still gets
+            # the prefix enforced, so the repo grounding survives a weak title model.
+            # Skipped when the name is already in the title anywhere — prepending there
+            # would read "Jetstream-APP: Fix upload in Jetstream-APP".
+            title = _clean_title(f"{repo_hint}: {title}")
         # Answer-shaped output guard: titling is a 3-7 word task, so a title with many words is a model that
         # ignored the task and answered the user's message instead ("I don't have context on X — that's not
         # something I recognize..."). Truncating would store half an assistant blob as the session title,
@@ -648,6 +899,7 @@ def auto_title_session(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     title_preview: str | None = None,
+    session_cwd: Optional[str] = None,
 ) -> None:
     """Generate and store the model title (daemon-thread target); skips sessions already carrying an
     ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
@@ -670,6 +922,7 @@ def auto_title_session(
         title, source = generate_title(
             user_message, failure_callback=failure_callback, main_runtime=main_runtime,
             runtime_validator=runtime_validator, title_preview=title_preview,
+            session_cwd=session_cwd,
         ), "llm"
         if title and _is_provisional_greeting_title(title):
             source = "derived"
@@ -743,6 +996,7 @@ def maybe_auto_title(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     title_preview: str | None = None,
+    session_cwd: Optional[str] = None,
 ) -> Optional[threading.Thread]:
     """Instant inline title, then a daemon-thread upgrade. Call at the START of a turn, before the model.
 
@@ -784,10 +1038,14 @@ def maybe_auto_title(
     # profile whose turn this is: a bare Thread starts with an empty context and lands on the launch
     # profile under multiplex, titling X's session with the default profile's model and billing its key.
     from agent.memory_provider import spawn_context_thread
-    upgrade_kwargs = dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
-                          runtime_validator=runtime_validator)
+    upgrade_kwargs: dict[str, Any] = dict(
+        failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
+        runtime_validator=runtime_validator,
+    )
     if isinstance(title_preview, str) and title_preview.strip():
         upgrade_kwargs["title_preview"] = title_preview
+    if isinstance(session_cwd, str) and session_cwd.strip():
+        upgrade_kwargs["session_cwd"] = session_cwd.strip()
     upgrade = spawn_context_thread(
         auto_title_session, name="auto-title",
         args=(session_db, session_id, user_message),
